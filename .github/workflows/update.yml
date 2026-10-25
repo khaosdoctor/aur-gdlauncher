@@ -1,0 +1,62 @@
+name: Update package
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: [PKGBUILD]
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new version
+        id: check
+        if: github.event_name != 'push'
+        run: |
+          manifest=$(curl -sfL https://cdn-raw.gdl.gg/launcher/latest-linux.yml)
+          latest=$(echo "$manifest" | awk '/^version:/ { print $2 }')
+          current=$(awk -F'"' '/^pkgver=/ { print $2 }' PKGBUILD)
+          echo "current=$current latest=$latest"
+          [ -n "$latest" ] || { echo "Could not read upstream version"; exit 1; }
+          [ "$latest" != "$current" ] || exit 0
+
+          file="GDLauncher__${latest}__linux__x64.AppImage"
+          curl -sfL -o app.AppImage "https://cdn-raw.gdl.gg/launcher/$file"
+          expected=$(echo "$manifest" | grep -A1 "url: $file" | awk '/sha512:/ { print $2 }')
+          actual=$(openssl dgst -sha512 -binary app.AppImage | base64 -w0)
+          [ "$expected" = "$actual" ] || { echo "sha512 mismatch for $file"; exit 1; }
+
+          old_sum=$(grep -oP "^sha256sums=\('\K[0-9a-f]+" PKGBUILD)
+          new_sum=$(sha256sum app.AppImage | cut -d' ' -f1)
+          rm app.AppImage
+          # ponytail: plain string replace, the action regenerates the real .SRCINFO for the AUR
+          sed -i -e "s/$current/$latest/g" -e "s/$old_sum/$new_sum/g" -e 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
+          sed -i -e "s/$current/$latest/g" -e "s/$old_sum/$new_sum/g" -e 's/pkgrel = .*/pkgrel = 1/' .SRCINFO
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to AUR
+        if: steps.check.outputs.version || github.event_name == 'push'
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: gdlauncher-carbon-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: Lucas Santos
+          commit_email: hello@lsantos.dev
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: ${{ steps.check.outputs.version && format('chore{0} upgrade to {1}', ':', steps.check.outputs.version) || github.event.head_commit.message }}
+
+      - name: Commit to GitHub
+        if: steps.check.outputs.version
+        run: |
+          git config user.name 'Lucas Santos'
+          git config user.email 'hello@lsantos.dev'
+          git commit -am 'chore: upgrade to ${{ steps.check.outputs.version }}'
+          git push
